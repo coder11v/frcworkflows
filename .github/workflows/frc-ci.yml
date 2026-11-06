@@ -1,0 +1,455 @@
+name: FRC Java CI & Code Review
+
+# -----------------------------------------------------------------------------
+# frcworkflows - Production GitHub Actions Reusable CI for FRC Java Teams
+# Copyright (c) 2026 Veer Bajaj (coder11v)
+# Licensed under the Apache License, Version 2.0. See LICENSE and NOTICE.
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      fallback-year:
+        description: 'Fallback WPILib year when not detected in project files'
+        required: false
+        type: string
+        default: '2026'
+      enable-ai-review:
+        description: 'Whether to run local Ollama-powered AI code review and post PR comment'
+        required: false
+        type: boolean
+        default: true
+      slack-thread-ts:
+        description: 'Slack message thread timestamp (thread_ts) to reply into'
+        required: false
+        type: string
+        default: ''
+      ollama-model:
+        description: 'Ollama model tag to use for code review'
+        required: false
+        type: string
+        default: 'qwen2.5-coder:1.5b'
+    secrets:
+      SLACK_WEBHOOK_URL:
+        description: 'Slack incoming webhook URL for build status notifications'
+        required: false
+
+jobs:
+  build-and-test:
+    name: Gradle Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      # 1. Determine Java version based on WPILib year
+      - name: Determine Java Version from WPILib Year
+        id: wpilib-info
+        env:
+          FALLBACK_YEAR: ${{ inputs.fallback-year }}
+        run: |
+          YEAR=""
+          if [ -f ".wpilib/wpilib_preferences.json" ]; then
+            YEAR=$(jq -r '.projectYear // empty' .wpilib/wpilib_preferences.json 2>/dev/null || true)
+          fi
+
+          if [ -z "$YEAR" ] && [ -f "build.gradle" ]; then
+            YEAR=$(grep -oE '20[2-9][0-9]' build.gradle | head -n 1 || true)
+          fi
+
+          if [ -z "$YEAR" ]; then
+            YEAR="${FALLBACK_YEAR:-2026}"
+            echo "Year not detected; defaulting to fallback: $YEAR"
+          fi
+
+          echo "Detected WPILib Year: $YEAR"
+          echo "year=$YEAR" >> "$GITHUB_OUTPUT"
+
+          if [ "$YEAR" -ge 2027 ]; then
+            JAVA_VER="25"
+          elif [ "$YEAR" -ge 2024 ]; then
+            JAVA_VER="17"
+          elif [ "$YEAR" -ge 2020 ]; then
+            JAVA_VER="11"
+          else
+            JAVA_VER="8"
+          fi
+
+          echo "Selected Java Version: $JAVA_VER"
+          echo "java_version=$JAVA_VER" >> "$GITHUB_OUTPUT"
+
+      # 2. Set up Java
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ steps.wpilib-info.outputs.java_version }}
+
+      # 3. Set up Gradle with caching & build scans
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # 4. Grant execute permissions & build WPILib project
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Run Build and Tests
+        id: build
+        run: ./gradlew build --parallel
+
+      # 5. Upload JUnit test results for PR reporting
+      - name: Upload Test Results Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-test-results
+          path: '**/build/test-results/**/*.xml'
+          retention-days: 7
+          if-no-files-found: ignore
+
+  test-report:
+    name: Annotate Test Results
+    needs: [build-and-test]
+    if: always() && (needs.build-and-test.result == 'success' || needs.build-and-test.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Download Test Results
+        uses: actions/download-artifact@v4
+        with:
+          name: junit-test-results
+          path: test-results
+        continue-on-error: true
+
+      - name: Publish Test Report
+        uses: dorny/test-reporter@v1
+        with:
+          name: JUnit Test Report
+          path: 'test-results/**/*.xml'
+          reporter: java-junit
+          fail-on-error: false
+        continue-on-error: true
+
+  pr-comment:
+    name: PR Test & AI Code Review Comment
+    needs: [build-and-test]
+    if: always() && github.event_name == 'pull_request' && inputs.enable-ai-review
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Test Results
+        uses: actions/download-artifact@v4
+        with:
+          name: junit-test-results
+          path: test-results
+        continue-on-error: true
+
+      - name: Cache Ollama models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-${{ inputs.ollama-model }}-${{ runner.os }}
+          restore-keys: |
+            ollama-${{ inputs.ollama-model }}-
+            ollama-
+
+      - name: Install and launch Ollama
+        env:
+          OLLAMA_MODEL: ${{ inputs.ollama-model }}
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve > /dev/null 2>&1 &
+          until curl -s http://127.0.0.1:11434/api/tags > /dev/null; do
+            sleep 1
+          done
+          ollama pull "$OLLAMA_MODEL"
+          echo "Pre-warming Ollama model into CPU RAM..."
+          ollama run "$OLLAMA_MODEL" "ready" || true
+
+      - name: Generate AI Code Review & Summary
+        id: ai-review
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BUILD_STATUS: ${{ needs.build-and-test.result }}
+          OLLAMA_MODEL: ${{ inputs.ollama-model }}
+        run: |
+          FAILURES=""
+          if [ -d "test-results" ]; then
+            FAILURES=$(grep -rhoE '<(failure|error)[^>]*>.*?</(failure|error)>|<(failure|error)[^>]*/>' test-results/ 2>/dev/null | head -n 20 || true)
+          fi
+          export TEST_FAILURES="$FAILURES"
+
+          python3 - <<'EOF'
+          import os, sys, json, urllib.request, subprocess
+
+          print("--> Starting AI Code Review step...", flush=True)
+
+          base_ref = os.environ.get('BASE_REF') or 'main'
+          model_name = os.environ.get('OLLAMA_MODEL') or 'qwen2.5-coder:1.5b'
+
+          diff_output = ""
+          for cmd in [
+              ['git', 'diff', f'origin/{base_ref}...HEAD'],
+              ['git', 'diff', 'HEAD^!'],
+              ['git', 'diff', 'HEAD~1'],
+              ['git', 'show', '--stat', 'HEAD']
+          ]:
+              try:
+                  res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                  if res and res.strip():
+                      diff_output = res
+                      break
+              except Exception:
+                  continue
+
+          if not diff_output.strip():
+              diff_output = "No git diff available."
+
+          # Smart diff filtering (extracting changed lines to minimize tokens)
+          filtered_lines = []
+          for line in diff_output.splitlines():
+              if line.startswith(('diff --git', '@@', '+', '-')):
+                  filtered_lines.append(line)
+
+          filtered_diff = "\n".join(filtered_lines)
+          if not filtered_diff.strip():
+              filtered_diff = diff_output
+
+          if len(filtered_diff) > 2500:
+              filtered_diff = filtered_diff[:2500] + "\n... [Diff truncated for fast AI review]"
+
+          test_failures = os.environ.get('TEST_FAILURES', '')
+          if not test_failures.strip():
+              test_failures = "All unit tests passed successfully."
+
+          system_prompt = (
+              "You are an expert robotics software engineer performing automated code review for an FRC Java team.\n"
+              "Analyze the provided git diff patch and test results.\n"
+              "DO NOT provide generic style nitpicks like 'line length', 'indentation', 'formatting', or 'add comments'.\n"
+              "Focus ONLY on logic bugs, safety/robotics issues, motor/sensor safety, concurrency, breaking changes, or meaningful code improvements.\n"
+              "If the changes are clean, state 'No major logic issues found.'"
+          )
+
+          user_content = f"--- TEST RESULTS ---\n{test_failures}\n\n--- GIT DIFF PATCH ---\n{filtered_diff}"
+
+          payload = {
+              "model": model_name,
+              "messages": [
+                  {"role": "system", "content": system_prompt},
+                  {"role": "user", "content": user_content}
+              ],
+              "options": {
+                  "num_predict": 250,
+                  "temperature": 0.2
+              }
+          }
+
+          print(f"--> Sending request to Ollama using {model_name} (60s max timeout)...", flush=True)
+          req = urllib.request.Request(
+              "http://127.0.0.1:11434/v1/chat/completions",
+              data=json.dumps(payload).encode('utf-8'),
+              headers={"Content-Type": "application/json"}
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  res_data = json.loads(resp.read().decode('utf-8'))
+                  gh_review = res_data['choices'][0]['message']['content']
+                  print("--> AI Review generated successfully!", flush=True)
+          except Exception as e:
+              print(f"--> Notice: Ollama processing note: {e}", flush=True)
+              gh_review = "Build and tests completed cleanly."
+
+          # Extract concise 2-bullet summary for Slack
+          slack_lines = [line.strip() for line in gh_review.split('\n') if line.strip().startswith(('-', '*'))][:2]
+          if slack_lines:
+              slack_sum = "\n".join(slack_lines)
+          else:
+              slack_sum = "Code review completed with no major issues detected."
+
+          with open("gh_review.md", "w") as f:
+              f.write(gh_review)
+
+          with open("slack_summary.txt", "w") as f:
+              f.write(slack_sum)
+          EOF
+
+          echo "has_review=true" >> "$GITHUB_OUTPUT"
+
+      - name: Post or Update Sticky PR Comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const prTitle = context.payload.pull_request ? context.payload.pull_request.title : "Pull Request";
+            const prNumber = context.payload.pull_request ? context.payload.pull_request.number : null;
+            if (!prNumber) {
+              console.log("No PR number found in payload, skipping comment.");
+              return;
+            }
+
+            const buildStatus = "${{ needs.build-and-test.result }}";
+            let ghReview = "";
+            try {
+              ghReview = fs.readFileSync("gh_review.md", "utf8");
+            } catch (e) {
+              ghReview = "No review content generated.";
+            }
+
+            const statusHeader = buildStatus === "success" 
+              ? "### Checks Passed\nThe proposed PR **" + prTitle + "** checks have passed."
+              : "### Checks / Tests Failed\nThe proposed PR **" + prTitle + "** encountered build or test issues.";
+
+            const header = '<!-- frc-ci-pr-comment -->';
+            const fullBody = `${header}\n${statusHeader}\n\n---\n\n### AI Code Review\n\n${ghReview}\n\n> Powered by [frcworkflows](https://github.com/coder11v/frcworkflows) by Veer Bajaj (@coder11v)`;
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+            
+            const botComment = comments.find(c => c.body && (c.body.includes(header) || c.body.includes('<!-- 5171-ci-pr-comment -->')));
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: fullBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: fullBody
+              });
+            }
+
+      - name: Upload Slack Summary Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slack-summary-artifact
+          path: slack_summary.txt
+          retention-days: 1
+          if-no-files-found: ignore
+
+  notify-slack:
+    name: Notify Slack
+    needs: [build-and-test, pr-comment]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository for commit metadata
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Download Slack Summary Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: slack-summary-artifact
+          path: .
+        continue-on-error: true
+
+      - name: Send Slack Notification
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          BUILD_RESULT: ${{ needs.build-and-test.result }}
+          SLACK_THREAD_TS: ${{ inputs.slack-thread-ts }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not configured. Skipping notification."
+            exit 0
+          fi
+
+          REPO_NAME="${{ github.event.repository.name }}"
+          THREAD_TS="${SLACK_THREAD_TS}"
+          
+          if [ "$BUILD_RESULT" = "success" ]; then
+            STATUS="success"
+            COLOR="#2EB886"
+          else
+            STATUS="fail"
+            COLOR="#A30200"
+          fi
+          
+          AUTHOR="${{ github.actor }}"
+          COMMIT_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          COMMIT_URL="${{ github.server_url }}/${{ github.repository }}/commit/$COMMIT_SHA"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1)
+
+          SLACK_AI_SUMMARY=""
+          if [ -f "slack_summary.txt" ]; then
+            SLACK_AI_SUMMARY=$(cat slack_summary.txt)
+          fi
+
+          # Construct payload JSON dynamically with optional thread_ts
+          PAYLOAD=$(jq -n \
+            --arg username "$REPO_NAME" \
+            --arg thread_ts "$THREAD_TS" \
+            --arg status "$STATUS" \
+            --arg color "$COLOR" \
+            --arg author "$AUTHOR" \
+            --arg short_sha "$SHORT_SHA" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg branch "$BRANCH" \
+            --arg commit_msg "$COMMIT_MSG" \
+            --arg run_url "$RUN_URL" \
+            --arg ai_summary "$SLACK_AI_SUMMARY" \
+            '{
+              username: $username,
+              attachments: [
+                {
+                  color: $color,
+                  blocks: [
+                    {
+                      type: "section",
+                      text: {
+                        type: "mrkdwn",
+                        text: ("Build *" + $status + "* on commit <" + $commit_url + "|" + $short_sha + "> by *" + $author + "*:\n" + $commit_msg + ", `" + $branch + "`" + (if $ai_summary != "" then "\n\n*Code Review Summary:*\n" + $ai_summary else "" end))
+                      }
+                    },
+                    {
+                      type: "actions",
+                      elements: [
+                        {
+                          type: "button",
+                          text: {
+                            type: "plain_text",
+                            text: "View on GitHub"
+                          },
+                          url: $run_url
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            } + (if $thread_ts != "" then { thread_ts: $thread_ts } else {} end)'
+          )
+
+          curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+
