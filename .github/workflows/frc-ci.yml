@@ -33,6 +33,9 @@ on:
       SLACK_WEBHOOK_URL:
         description: 'Slack incoming webhook URL for build status notifications'
         required: false
+      COMMENT_TOKEN:
+        description: 'Custom token (e.g., GitHub App installation token or bot PAT) to author PR comments instead of github-actions[bot]. Defaults to GITHUB_TOKEN.'
+        required: false
 
 jobs:
   build-and-test:
@@ -295,7 +298,7 @@ jobs:
       - name: Post or Update Sticky PR Comment
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.COMMENT_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const prTitle = context.payload.pull_request ? context.payload.pull_request.title : "Pull Request";
