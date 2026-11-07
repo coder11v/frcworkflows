@@ -21,6 +21,6 @@ jobs:
     with:
       fallback-year: "2026"
       enable-ai-review: true
-      bot-app-id: ${{ vars.BOT_APP_ID || '5648265' }}
+      bot-app-id: "5648265"
     secrets:
       BOT_APP_PRIVATE_KEY: ${{ secrets.BOT_APP_PRIVATE_KEY }}
