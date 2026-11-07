@@ -12,7 +12,7 @@ concurrency:
 jobs:
   frc-ci:
     name: Run FRC CI
-    uses: ./.github/workflows/frc-ci.yml
+    uses: coder11v/frcworkflows/.github/workflows/frc-ci.yml@main
     permissions:
       contents: read
       checks: write
