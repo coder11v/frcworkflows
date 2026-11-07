@@ -29,12 +29,20 @@ on:
         required: false
         type: string
         default: 'qwen2.5-coder:1.5b'
+      bot-app-id:
+        description: 'GitHub App ID to author PR comments as a custom bot identity'
+        required: false
+        type: string
+        default: ''
     secrets:
       SLACK_WEBHOOK_URL:
         description: 'Slack incoming webhook URL for build status notifications'
         required: false
       COMMENT_TOKEN:
-        description: 'Custom token (e.g., GitHub App installation token or bot PAT) to author PR comments instead of github-actions[bot]. Defaults to GITHUB_TOKEN.'
+        description: 'Custom token (e.g. PAT) to author PR comments. Defaults to GITHUB_TOKEN if bot credentials are not provided.'
+        required: false
+      BOT_APP_PRIVATE_KEY:
+        description: 'GitHub App private key (PEM format) to author PR comments as the custom bot identity'
         required: false
 
 jobs:
@@ -295,10 +303,19 @@ jobs:
 
           echo "has_review=true" >> "$GITHUB_OUTPUT"
 
+      - name: Generate Custom Bot Token
+        if: ${{ secrets.BOT_APP_PRIVATE_KEY != '' && inputs.bot-app-id != '' }}
+        id: bot-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ inputs.bot-app-id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Post or Update Sticky PR Comment
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.COMMENT_TOKEN || secrets.GITHUB_TOKEN }}
+          github-token: ${{ steps.bot-token.outputs.token || secrets.COMMENT_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const prTitle = context.payload.pull_request ? context.payload.pull_request.title : "Pull Request";
