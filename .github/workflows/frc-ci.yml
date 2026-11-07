@@ -304,9 +304,11 @@ jobs:
           echo "has_review=true" >> "$GITHUB_OUTPUT"
 
       - name: Generate Custom Bot Token
-        if: ${{ secrets.BOT_APP_PRIVATE_KEY != '' && inputs.bot-app-id != '' }}
+        if: ${{ env.BOT_KEY != '' && inputs.bot-app-id != '' }}
         id: bot-token
         uses: actions/create-github-app-token@v1
+        env:
+          BOT_KEY: ${{ secrets.BOT_APP_PRIVATE_KEY }}
         with:
           app-id: ${{ inputs.bot-app-id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
