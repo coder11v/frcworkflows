@@ -41,7 +41,7 @@ concurrency:
 jobs:
   frc-ci:
     name: FRC CI
-    uses: coder11v/frcworkflows/.github/workflows/frc-ci.yml@v1.0.0
+    uses: coder11v/frcworkflows/.github/workflows/frc-ci.yml@v1.1
     permissions:
       contents: read
       checks: write
@@ -111,7 +111,7 @@ By default, comments are posted by `github-actions[bot]`. If you want PR comment
 
      frc-ci:
        needs: [generate-token]
-       uses: coder11v/frcworkflows/.github/workflows/frc-ci.yml@v1.0.0
+       uses: coder11v/frcworkflows/.github/workflows/frc-ci.yml@v1.1
        permissions:
          contents: read
          checks: write
