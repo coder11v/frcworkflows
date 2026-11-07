@@ -16,3 +16,4 @@ EOF
 
 echo "Simulated Gradle build: compileJava finished, tests executed."
 exit 0
+

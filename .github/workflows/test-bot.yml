@@ -38,3 +38,4 @@ jobs:
       enable-ai-review: true
     secrets:
       COMMENT_TOKEN: ${{ needs.generate-token.outputs.token }}
+
