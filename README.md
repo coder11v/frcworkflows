@@ -74,55 +74,46 @@ jobs:
 | Secret | Required | Description |
 | :--- | :---: | :--- |
 | `SLACK_WEBHOOK_URL` | No | Slack incoming webhook URL for CI notifications. If omitted, Slack notifications are cleanly skipped. |
-| `COMMENT_TOKEN` | No | Optional token generated from a custom GitHub App (or bot account) to author sticky PR comments as your bot (e.g. `team-bot[bot]`) instead of `github-actions[bot]`. Defaults to `GITHUB_TOKEN`. |
+| `BOT_APP_PRIVATE_KEY` | No | GitHub App private key (`.pem` format) to author PR comments as a custom bot identity. Used together with `bot-app-id`. |
+| `COMMENT_TOKEN` | No | Optional pre-generated token (or PAT) to author PR comments instead of `github-actions[bot]`. Defaults to `GITHUB_TOKEN`. |
 
 ---
 
 ## Customizing Commenter Identity (Using a GitHub App)
 
-By default, comments are posted by `github-actions[bot]`. If you want PR comments to appear from a custom identity (e.g., `5171-bot[bot]` or `frc-reviewer[bot]`) with your custom team logo/avatar:
+By default, comments are posted by `github-actions[bot]`. To have comments posted under a custom bot identity (e.g. `5171-bot[bot]` or `sad-guy-bot[bot]`) with your custom team avatar:
 
 1. **Create a GitHub App**:
-   - Go to **Organization / Account Settings** > **Developer Settings** > **GitHub Apps** > **New GitHub App**.
-   - Set the App name (e.g., `Team 5171 Robot Reviewer`) and upload your custom logo/avatar.
+   - Go to **Settings** > **Developer Settings** > **GitHub Apps** > **New GitHub App**.
+   - Name your App and upload your avatar.
    - Disable Webhooks (uncheck "Active").
    - Under **Repository Permissions**, grant:
      - `Pull requests`: **Read & write**
      - `Issues`: **Read & write**
    - Click **Create GitHub App**.
-   - Generate and download a **Private Key** (`.pem` file), and note the **App ID**.
+   - Note the **App ID** and generate/download a **Private Key** (`.pem` file).
 2. **Install the App**:
-   - In the GitHub App settings, click **Install App** and install it on your target robot repositories.
-3. **Add Secrets in Caller Repository**:
-   - Add `BOT_APP_ID` (the App ID) and `BOT_APP_PRIVATE_KEY` (the `.pem` private key content) to repository/organization secrets.
-4. **Pass the Generated Token to the Workflow**:
+   - Under your App's settings, click **Install App** and select your robot repositories (or entire organization).
+3. **Add Secret in Robot Repository (or Organization)**:
+   - Add `BOT_APP_PRIVATE_KEY` with the entire content of the `.pem` file.
+4. **Call the Workflow Directly**:
    ```yaml
    jobs:
-     generate-token:
-       runs-on: ubuntu-latest
-       outputs:
-         token: ${{ steps.app-token.outputs.token }}
-       steps:
-         - uses: actions/create-github-app-token@v1
-           id: app-token
-           with:
-             app-id: ${{ secrets.BOT_APP_ID }}
-             private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-
      frc-ci:
-       needs: [generate-token]
+       name: FRC CI
        uses: coder11v/frcworkflows/.github/workflows/frc-ci.yml@v1.1
        permissions:
-         contents: read
+         contents: write
          checks: write
          pull-requests: write
          issues: write
        with:
          fallback-year: "2026"
          enable-ai-review: true
+         bot-app-id: ${{ vars.BOT_APP_ID || '5648265' }}
        secrets:
-         COMMENT_TOKEN: ${{ needs.generate-token.outputs.token }}
          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+         BOT_APP_PRIVATE_KEY: ${{ secrets.BOT_APP_PRIVATE_KEY }}
    ```
 
 ---
